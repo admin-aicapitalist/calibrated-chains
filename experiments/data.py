@@ -60,6 +60,21 @@ def sample(name: str) -> pd.DataFrame:
         df = load("test")
         others = df[~df.is_invoice].groupby("category", group_keys=False).sample(8, random_state=0)
         return pd.concat([df[df.is_invoice], others]).sort_index()
+    if name == "chain_cal":
+        # Full-chain calibration: every validation invoice + bal120's 60 non-invoices.
+        df = load("validation")
+        bal = sample("bal120")
+        return pd.concat([df[df.is_invoice], bal[~bal.is_invoice]]).sort_index()
+    if name == "chain_ver":
+        # Small held-out set for the full chain: 40 test invoices + 3 docs from each other class.
+        df = load("test")
+        invoices = df[df.is_invoice].sample(40, random_state=0)
+        others = df[~df.is_invoice].groupby("category", group_keys=False).sample(3, random_state=0)
+        return pd.concat([invoices, others]).sort_index()
+    if name == "chain_atoms":
+        # Docs needing the atomic-condition pass: bal120's invoices + all of chain_ver.
+        bal = sample("bal120")
+        return pd.concat([bal[bal.is_invoice], sample("chain_ver")]).sort_index()
     if name == "dev10":
         return load("validation").groupby("category", group_keys=False).sample(frac=0.1, random_state=0).sort_index()
     if name == "dev":

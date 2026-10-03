@@ -397,3 +397,41 @@ Without being told, the compiler picks a text-judge + image-judge ensemble, the 
 E5 identified as genuinely diverse. Against the text-only compile (C3): invoices accepted
 40 → 54, still 0 false accepts, bound 7.22% → 5.40%, a few more accepted invoices away from
 a 5% certification.
+
+### L1 · Labeling the chain with Claude (silver labels)
+
+RVL-CDIP only labels document type, so the later chain steps had no labels. Claude subagents
+labeled **100 RVL "invoices"** (bal120's 60 for calibration + 40 random test invoices for
+held-out verification) from the **scan image plus OCR**, following
+[labels/GUIDE.md](../labels/GUIDE.md): `is_invoice`, `invoice_type`, `amount_consistent`
+(total legible and consistent with the charges), `total`, `approve` (explicit policy: an invoice
+requesting payment, standard or recurring, identifiable vendor, legible total under $5,000,
+remit-to present), confidence, one-line evidence note. 4 agents × 25 docs in parallel, ~1.5 min
+each. To fit a 2-hour limit the chain was reshaped so every neural step is labelable: the 0-4
+`amount_reasonable` score became the yes/no `amount_consistent`.
+
+**Labeler agreement** (independent second pass on 20 docs): is_invoice 20/20, invoice_type 20/20,
+amount_consistent 20/20, approve 19/20 (one policy edge case). 79/80 field labels agree.
+
+**What the labels say about the data:**
+
+| | count |
+|---|---|
+| RVL "invoices" labeled | 100 |
+| real invoices per Claude | **63** |
+| not invoices: checks / remittance stubs | 21 |
+| not invoices: payment vouchers / contribution or check requests | 6 |
+| not invoices: purchase orders, statements, other | 10 |
+| invoice types: standard / recurring / proforma / credit note | 50 / 7 / 5 / 1 |
+| total legible and consistent | 52 |
+| **approvable under the policy** | **17** (cal 9, held-out 8) |
+| labeler confidence high / medium / low | 51 / 41 / 8 |
+
+**Finding:** RVL-CDIP's `invoice` class is ~37% payer-side payment paperwork (checks, remittance
+stubs, vouchers) rather than vendor bills. That's a much larger label-noise rate than the single
+mislabel found in E1, and every earlier `is_invoice` number was measured against those noisy
+labels. From here the chain uses Claude's labels for the 100 labeled docs.
+
+**Caveat:** these are silver labels. A chain compiled on them certifies agreement with Claude's
+reading of the documents under the written policy, not ground truth. The 79/80 agreement says the
+labels are consistent; it can't say they're right.

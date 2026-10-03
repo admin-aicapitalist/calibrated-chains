@@ -165,3 +165,17 @@ def test_stop_budget_is_a_miss_rate_and_holds_under_any_class_mix():
         g = result.gate
         assert g.wrong_stops == 0                      # the certified gate blocks the unreliable no's instead
         assert g.useful == 70 and g.tau_for("false") > 0.97
+
+
+def test_sequential_calibrates_later_steps_on_examples_that_reach_them():
+    # Step 2 is noisy only on inputs that step 1 confidently stops; sequential calibration never sees them.
+    inputs = [f"d{i}" for i in range(400)]
+    first = {d: 0.99 if i < 300 else 0.01 for i, d in enumerate(inputs)}
+    second = {d: 0.99 if i < 300 else (0.99 if i % 2 else 0.01) for i, d in enumerate(inputs)}
+    b1, b2 = noul_backend(first), noul_backend(second)
+    spec = [NeuralStep("s1", "noul", [Candidate("c1", plain(qid="s1").build, backend=b1)], budget_on="continue"),
+            NeuralStep("s2", "noul", [Candidate("c2", plain(qid="s2").build, backend=b2)], budget_on="continue")]
+    examples = [Example(d, d, {"s1": i < 300, "s2": i < 300}) for i, d in enumerate(inputs)]
+    flat = Compiler(spec, b1).compile(examples, 0.05).results["s2"].gate
+    seq = Compiler(spec, b1).compile(examples, 0.05, sequential=True).results["s2"].gate
+    assert flat.errors == 50 and seq.errors == 0 and seq.n == 300

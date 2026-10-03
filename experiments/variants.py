@@ -164,3 +164,62 @@ def j_clerk(text: str) -> dict[str, Any]:
         "type": "noul",
         "instructions": "Would an accounts-payable clerk enter this document into the payables system as a vendor bill to pay?",
         "criteria": INVOICE_CRITERIA}}}
+
+
+# --- full invoice chain (C5): every neural step of the approval chain in one forward pass ---
+
+INVOICE_TYPES = {
+    "standard": "A regular bill for goods or services already delivered",
+    "proforma": "A preliminary bill, quote or estimate sent before delivery or as advance billing",
+    "credit_note": "A credit memo or document reducing an amount owed",
+    "recurring": "A periodic charge: retainer, subscription, rent, monthly fees or dues",
+}
+
+AMOUNT_CRITERIA = {
+    "true": "A total amount is legible and consistent with the listed charges or line items (no obvious "
+            "arithmetic or plausibility problem).",
+    "false": "No legible total, or the total conflicts with the listed charges, or the amount is implausible.",
+}
+
+APPROVE_POLICY = (
+    "Approval policy: approve for payment only if ALL hold: (1) it is an invoice requesting payment, not a "
+    "statement, receipt, copy for records, or already-paid notice; (2) it is a standard or recurring bill; "
+    "(3) the vendor is identifiable; (4) the total due is legible and under $5,000; (5) remit-to or payment "
+    "details are present. Should this invoice be approved for payment?"
+)
+
+
+def _chain_questions() -> dict[str, Any]:
+    return {
+        "is_invoice": {"type": "noul", "instructions": "Is this document an invoice?", "criteria": INVOICE_CRITERIA},
+        "invoice_type": {"type": "choice", "instructions": "If this is an invoice, what type is it?",
+                         "criteria": INVOICE_TYPES},
+        "amount_consistent": {"type": "noul", "instructions": "Is the invoice total legible and consistent?",
+                              "criteria": AMOUNT_CRITERIA},
+        "approve": {"type": "noul", "instructions": APPROVE_POLICY},
+    } | {name: {"type": "noul", "instructions": text_} for name, text_ in EVIDENCE.items()}
+
+
+@variant
+def c_text(text: str) -> dict[str, Any]:
+    """All chain questions on the OCR text."""
+    return {"state": {"source": FRAMING, "ocr_text": text}, "questions": _chain_questions()}
+
+
+@variant
+@needs_image
+def c_image(text: str, image: Any) -> dict[str, Any]:
+    """All chain questions on the scan plus OCR text."""
+    return {"state": {"source": FRAMING + " The original scan is attached as an image.", "ocr_text": text},
+            "questions": _chain_questions(), "images": [image]}
+
+
+@variant
+def c_atoms(text: str) -> dict[str, Any]:
+    """Atomic conditions of the approval policy (approve itself becomes a symbolic AND)."""
+    return {"state": {"source": FRAMING, "ocr_text": text}, "questions": {
+        "under_5000": {"type": "noul", "instructions": "Is the total amount due legible and under $5,000?"},
+        "payable": {"type": "noul", "instructions": (
+            "Is this a bill to pay now: payment is requested (not marked paid, not a copy for records, not a "
+            "statement or receipt), the vendor is identifiable, and remit-to or payment details are given?")},
+    }}

@@ -32,8 +32,8 @@ from typing import Any, Callable
 from clef_monad import Backend, Decision, Entry, Step, band
 
 Request = dict[str, Any]  # SystemOne request body: {"state": ..., "questions": {...}}
-TAUS = [round(0.5 + i * 0.005, 3) for i in range(100)]  # 0.500 ... 0.995
-PAIR_TAUS = [round(0.5 + i * 0.01, 2) for i in range(50)]  # coarser grid for per-answer (yes/no) gates
+TAUS = [round(0.505 + i * 0.005, 3) for i in range(99)]  # 0.505 ... 0.995; a coin flip (0.5) never passes
+PAIR_TAUS = [round(0.51 + i * 0.01, 2) for i in range(49)]  # coarser grid for per-answer (yes/no) gates
 
 
 # --- chain spec --------------------------------------------------------------------------------------
@@ -353,15 +353,28 @@ class Compiler:
         return [s for s in self.spec if isinstance(s, NeuralStep)]
 
     def compile(self, examples: list[Example], error_budget: float,
-                priors: dict[str, dict[Any, float]] | None = None) -> CompiledChain:
+                priors: dict[str, dict[Any, float]] | None = None, sequential: bool = False) -> CompiledChain:
         """``priors`` maps step name -> production label distribution (e.g. {"is_invoice": {True: 0.06,
         False: 0.94}}); calibration examples are reweighted to it, so the certified rate is the one
-        production will see rather than the calibration sample's mix."""
+        production will see rather than the calibration sample's mix.
+
+        ``sequential=True`` calibrates each step only on the examples the already-compiled earlier gates
+        let through with a continue answer: the population that actually reaches the step in the chain."""
         steps = self.neural_steps()
         per_step = 1 - (1 - error_budget) ** (1 / max(len(steps), 1))
         priors = priors or {}
-        results = {s.name: self._calibrate(s, examples, per_step, priors.get(s.name)) for s in steps}
+        results, reaching = {}, list(examples)
+        for step in steps:
+            results[step.name] = result = self._calibrate(step, reaching, per_step, priors.get(step.name))
+            if sequential:
+                reaching = [e for e in reaching if self._continues(step, result, e)]
         return CompiledChain(self.spec, results, self.backend, error_budget, self.confidence, priors)
+
+    def _continues(self, step: NeuralStep, result: StepResult, example: Example) -> bool:
+        probs = ask(result.chosen, step, example.input, self.backend, self.cache, example.id)
+        option = max(probs, key=probs.__getitem__)
+        allowed = step.continue_options()
+        return probs[option] >= result.gate.tau_for(option) and (allowed is None or option in allowed)
 
     def _calibrate(self, step: NeuralStep, examples: list[Example], budget: float,
                    prior: dict[Any, float] | None = None) -> StepResult:
@@ -414,7 +427,8 @@ class CompiledChain:
     confidence: float
     priors: dict[str, dict[Any, float]] = field(default_factory=dict)
 
-    def run(self, raw: Any) -> Decision:
+    def run(self, raw: Any, cache: AnswerCache | None = None, example_id: str | None = None) -> Decision:
+        """Run the chain with frozen gates. ``cache``/``example_id`` replay recorded answers (offline eval)."""
         decision = Decision.pure(raw)
         for step in self.spec:
             if isinstance(step, Guard):
@@ -422,14 +436,14 @@ class CompiledChain:
             elif isinstance(step, Map):
                 decision = decision.map(step.name, step.fn)
             else:
-                decision = decision.bind(self._step(step))
+                decision = decision.bind(self._step(step, cache, example_id))
         return decision
 
-    def _step(self, step: NeuralStep) -> Step:
+    def _step(self, step: NeuralStep, cache: AnswerCache | None = None, example_id: str | None = None) -> Step:
         result = self.results[step.name]
 
         def run(ctx: dict[str, Any]) -> Decision:
-            probs = ask(result.chosen, step, ctx["state"], self.backend)
+            probs = ask(result.chosen, step, ctx["state"], self.backend, cache, example_id)
             option = max(probs, key=probs.__getitem__)
             confidence = probs[option]
             value = (option == "true") if step.kind == "noul" else option
