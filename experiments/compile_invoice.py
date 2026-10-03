@@ -94,7 +94,8 @@ def main(samples: str, budgets: list[float]) -> None:
     by_name = {c.name: c for c in singles}
     votes = [ensemble(name, *(by_name[m] for m in members)) for name, members in ENSEMBLES.items()
              if all(m in by_name for m in members)]
-    spec = [NeuralStep(STEP, "noul", singles + votes)]
+    # Approval chain: a wrong "yes" flows toward payment (budgeted); a wrong "no" stops the chain (reported).
+    spec = [NeuralStep(STEP, "noul", singles + votes, budget_on="continue", stop_budget=0.10)]
 
     out = [f"# Compiling `{STEP}` on {calib_name}" + (f", verifying on {verify_name}" if verify_name else ""), "",
            f"{len(examples)} labeled calibration docs (audited labels), {len(singles)} single formulations, "
@@ -102,11 +103,12 @@ def main(samples: str, budgets: list[float]) -> None:
            f"{', '.join(v for v in SINGLES if v not in by_name) or 'none'}.", ""]
     if verify_name:
         out += [f"Held-out {verify_name}: {len(held_out)} docs; formulations with runs there: {', '.join(verifiable)}.", ""]
-    for budget, asymmetric in [(b, a) for b in budgets for a in (False, True)]:
+    production = {STEP: {True: 1 / 16, False: 15 / 16}}  # natural RVL-CDIP invoice share
+    for budget, asymmetric, priors in [(b, a, pr) for b in budgets for a in (False, True) for pr in (None, production)]:
         compiler = Compiler(spec, backend=no_model, asymmetric=asymmetric)
         compiler.cache = cache
-        compiled = compiler.compile(examples, error_budget=budget)
-        mode = "separate yes/no gates" if asymmetric else "one gate"
+        compiled = compiler.compile(examples, error_budget=budget, priors=priors)
+        mode = ("separate yes/no gates" if asymmetric else "one gate") + (", production mix (1/16 invoices)" if priors else ", sample mix")
         out += [f"## Budget {budget:.0%}, {mode}", "", compiled.report().replace("# Calibration report", "### Report"), ""]
         if verify_name:
             chosen = compiled.results[STEP].chosen

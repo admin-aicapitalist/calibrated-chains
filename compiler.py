@@ -66,6 +66,20 @@ class NeuralStep:
     candidates: tuple[Candidate, ...] | list[Candidate]
     expect: Any = True  # noul: the answer that continues the chain
     allowed: frozenset[str] | None = None  # choice: answers that continue the chain
+    # Which wrong answers the error budget covers. "all": any confident wrong answer. "continue": only wrong
+    # answers that continue the chain (they flow on toward an action); a confident wrong stop is reported
+    # as a wrong stop (missed automation) but doesn't consume budget, and the gate maximises correct continues.
+    budget_on: str = "all"
+    # With budget_on="continue": bound on the miss rate (share of should-continue inputs confidently stopped,
+    # e.g. real invoices silently rejected). None = stops are unconstrained and
+    # the gate maximises correct continues, then minimises wrong stops (blocking no's sends them to review).
+    # A number = both budgets must hold and the gate maximises everything decided without review.
+    stop_budget: float | None = None
+
+    def continue_options(self) -> set[str] | None:
+        if self.kind == "noul":
+            return {_option(self.expect)}
+        return set(self.allowed) if self.allowed else None
 
 
 @dataclass(frozen=True)
@@ -180,14 +194,25 @@ class GateStats:
     n: int  # labeled examples
     passed: int
     errors: int  # wrong AND passed
-    bound: float  # upper confidence bound on errors / passed
+    bound: float  # upper confidence bound on the (prior-weighted) silent-error rate
+    w_coverage: float | None = None  # share passed, weighted to the target prior (None = unweighted)
+    w_rate: float | None = None  # silent-error rate among passed, weighted to the target prior
+    ess: float | None = None  # effective sample size of the passed decisions under the weights
+    useful: int = 0  # correct decisions inside the budget's scope
+    wrong_stops: int = 0  # confident wrong answers outside the scope (budget_on="continue")
+    stop_rate: float = 0.0  # miss rate: wrong stops / examples whose true answer continues the chain
+    stop_bound: float = 0.0  # upper bound on the miss rate
 
     @property
     def coverage(self) -> float:
+        if self.w_coverage is not None:
+            return self.w_coverage
         return self.passed / self.n if self.n else 0.0
 
     @property
     def rate(self) -> float:
+        if self.w_rate is not None:
+            return self.w_rate
         return self.errors / self.passed if self.passed else 0.0
 
     def tau_for(self, option: str) -> float:
@@ -204,36 +229,89 @@ class GateStats:
         return " / ".join(f"{o} ≥{t:.2f}" for o, t in self.taus.items())
 
 
-def gate_stats(preds: list[tuple[str, float, bool]], taus: dict[str, float] | float, confidence: float,
-               budget: float | None = None) -> GateStats:
-    """preds: (predicted option, its probability, correct?). A decision passes if its probability clears the
-    threshold for the option it predicts. With ``budget``, the exact bound is skipped (reported as 1.0)
-    when the observed rate alone already exceeds it, since the bound is never below the rate."""
+Pred = tuple[str, float, bool, float, str]  # (predicted option, its probability, correct?, weight, true option)
+
+
+def _rate_bound(items: list[tuple[bool, float]], confidence: float,
+                budget: float | None) -> tuple[int, float, float | None, float]:
+    """(raw errors, rate, effective size or None if unweighted, upper bound) for (correct?, weight) items.
+    Weighted items use the Kish effective sample size, rounded conservatively (errors up, size down).
+    The exact bound is skipped (1.0) when the observed rate alone exceeds ``budget``."""
+    errors = sum(1 for ok, _ in items if not ok)
+    if not items:
+        return 0, 0.0, None, 1.0
+    if all(w == 1.0 for _, w in items):
+        rate, ess = errors / len(items), None
+        bound = 1.0 if budget is not None and rate > budget else upper_bound(errors, len(items), confidence)
+        return errors, rate, ess, bound
+    w_sum = sum(w for _, w in items)
+    rate = sum(w for ok, w in items if not ok) / w_sum
+    ess = w_sum ** 2 / sum(w * w for _, w in items)
+    if budget is not None and rate > budget:
+        return errors, rate, ess, 1.0
+    return errors, rate, ess, upper_bound(math.ceil(rate * ess - 1e-9), math.floor(ess + 1e-9), confidence)
+
+
+def gate_stats(preds: list[Pred], taus: dict[str, float] | float, confidence: float,
+               budget: float | None = None, scope: set[str] | None = None,
+               stop_budget: float | None = None) -> GateStats:
+    """A decision passes if its probability clears the threshold for the option it predicts.
+
+    ``scope`` (options that continue the chain) splits passed decisions: the main rate and bound cover
+    in-scope decisions (wrong continues), and stop_rate / stop_bound cover the rest (wrong stops). Weighted
+    preds (reweighted to a target prior) give weighted rates and coverage with effective-size bounds."""
     taus = {"*": taus} if isinstance(taus, (int, float)) else taus
     probe = GateStats(taus, 0, 0, 0, 0)
-    passed = [ok for option, conf, ok in preds if conf >= probe.tau_for(option)]
-    errors = sum(1 for ok in passed if not ok)
-    if budget is not None and passed and errors / len(passed) > budget:
-        return GateStats(taus, len(preds), len(passed), errors, 1.0)
-    return GateStats(taus, len(preds), len(passed), errors, upper_bound(errors, len(passed), confidence))
+    all_passed = [(option, ok, w) for option, conf, ok, w, _ in preds if conf >= probe.tau_for(option)]
+    in_scope = [(ok, w) for option, ok, w in all_passed if scope is None or option in scope]
+    errors, rate, ess, bound = _rate_bound(in_scope, confidence, budget)
+    # Wrong stops are measured as a miss rate: the share of examples whose true answer continues the chain
+    # that were confidently stopped. Class-conditional, so it doesn't depend on the class mix.
+    should_continue = sum(1 for *_, truth in preds if scope is not None and truth in scope)
+    wrong_stops = sum(1 for option, ok, _ in all_passed if scope is not None and option not in scope and not ok)
+    stop_rate = wrong_stops / should_continue if should_continue else 0.0
+    if scope is None or not should_continue:
+        stop_bound = 0.0
+    elif stop_budget is not None and stop_rate > stop_budget:
+        stop_bound = 1.0
+    else:
+        stop_bound = upper_bound(wrong_stops, should_continue, confidence)
+    weighted = not all(p[3] == 1.0 for p in preds)
+    total = sum(p[3] for p in preds)
+    return GateStats(taus, len(preds), len(all_passed), errors, bound,
+                     w_coverage=sum(w for *_, w in all_passed) / total if weighted and total else None,
+                     w_rate=rate if weighted else None, ess=ess,
+                     useful=len(in_scope) - errors, wrong_stops=wrong_stops,
+                     stop_rate=stop_rate, stop_bound=stop_bound)
 
 
-def predictions(probs: list[dict[str, float]], truths: list[Any]) -> list[tuple[str, float, bool]]:
+def predictions(probs: list[dict[str, float]], truths: list[Any], weights: list[float] | None = None) -> list[Pred]:
     out = []
-    for p, truth in zip(probs, truths):
+    for i, (p, truth) in enumerate(zip(probs, truths)):
         option = max(p, key=p.__getitem__)
-        out.append((option, p[option], option == _option(truth)))
+        out.append((option, p[option], option == _option(truth), weights[i] if weights else 1.0, _option(truth)))
     return out
+
+
+def prior_weights(truths: list[Any], prior: dict[Any, float] | None) -> list[float] | None:
+    """Importance weights that reweight the labeled sample to a target label distribution."""
+    if not prior:
+        return None
+    counts = {}
+    for t in truths:
+        counts[_option(t)] = counts.get(_option(t), 0) + 1
+    target = {_option(k): v for k, v in prior.items()}
+    return [target.get(_option(t), 0.0) / (counts[_option(t)] / len(truths)) for t in truths]
 
 
 def _option(truth: Any) -> str:
     return ("true" if truth else "false") if isinstance(truth, bool) else str(truth)
 
 
-def error_correlation(a: list[tuple[str, float, bool]], b: list[tuple[str, float, bool]]) -> float:
-    """Phi coefficient between two candidates' error indicators (thresholded, no gate)."""
-    x = [not ok for _, _, ok in a]
-    y = [not ok for _, _, ok in b]
+def error_correlation(a: list[Pred], b: list[Pred]) -> float:
+    """Phi coefficient between two candidates' error indicators (thresholded, no gate, unweighted)."""
+    x = [not p[2] for p in a]
+    y = [not p[2] for p in b]
     n = len(x)
     sx, sy, sxy = sum(x), sum(y), sum(1 for i, j in zip(x, y) if i and j)
     den = math.sqrt(sx * (n - sx) * sy * (n - sy))
@@ -265,34 +343,52 @@ class Compiler:
     def neural_steps(self) -> list[NeuralStep]:
         return [s for s in self.spec if isinstance(s, NeuralStep)]
 
-    def compile(self, examples: list[Example], error_budget: float) -> CompiledChain:
+    def compile(self, examples: list[Example], error_budget: float,
+                priors: dict[str, dict[Any, float]] | None = None) -> CompiledChain:
+        """``priors`` maps step name -> production label distribution (e.g. {"is_invoice": {True: 0.06,
+        False: 0.94}}); calibration examples are reweighted to it, so the certified rate is the one
+        production will see rather than the calibration sample's mix."""
         steps = self.neural_steps()
         per_step = 1 - (1 - error_budget) ** (1 / max(len(steps), 1))
-        results = {s.name: self._calibrate(s, examples, per_step) for s in steps}
-        return CompiledChain(self.spec, results, self.backend, error_budget, self.confidence)
+        priors = priors or {}
+        results = {s.name: self._calibrate(s, examples, per_step, priors.get(s.name)) for s in steps}
+        return CompiledChain(self.spec, results, self.backend, error_budget, self.confidence, priors)
 
-    def _calibrate(self, step: NeuralStep, examples: list[Example], budget: float) -> StepResult:
+    def _calibrate(self, step: NeuralStep, examples: list[Example], budget: float,
+                   prior: dict[Any, float] | None = None) -> StepResult:
         labeled = [e for e in examples if step.name in e.labels]
         truths = [e.labels[step.name] for e in labeled]
+        weights = prior_weights(truths, prior)
         table, preds_by = [], {}
         for candidate in step.candidates:
             probs = [ask(candidate, step, e.input, self.backend, self.cache, e.id) for e in labeled]
-            preds = preds_by[candidate.name] = predictions(probs, truths)
+            preds = preds_by[candidate.name] = predictions(probs, truths, weights)
+            scope = step.continue_options() if step.budget_on == "continue" else None
+            stop_budget = step.stop_budget if scope else None
             if self.asymmetric and step.kind == "noul":
-                gates = [gate_stats(preds, {"true": ty, "false": tn}, self.confidence, budget)
+                gates = [gate_stats(preds, {"true": ty, "false": tn}, self.confidence, budget, scope, stop_budget)
                          for ty in PAIR_TAUS for tn in PAIR_TAUS]
             else:
-                gates = [gate_stats(preds, tau, self.confidence) for tau in TAUS]
-            ok = [g for g in gates if g.passed and g.bound <= budget]
+                gates = [gate_stats(preds, tau, self.confidence, None, scope, stop_budget) for tau in TAUS]
+            ok = [g for g in gates if g.useful and g.bound <= budget
+                  and (stop_budget is None or g.stop_bound <= stop_budget)]
             if not ok and any(g.bound == 1.0 and g.passed for g in gates):  # fill skipped bounds for the report
-                gates = [g if g.bound < 1.0 or not g.passed else gate_stats(preds, g.taus, self.confidence) for g in gates]
-            # Among gates passing the same decisions, take the strictest: a looser one would also pass
+                gates = [g if g.bound < 1.0 or not g.passed else gate_stats(preds, g.taus, self.confidence, None, scope)
+                         for g in gates]
+            # Objective: with a stop budget, everything decided without review; otherwise correct in-scope
+            # decisions, then fewest wrong stops. Ties go to the strictest gate: a looser one would also pass
             # confidence levels the calibration data never showed, which nothing here has certified.
-            best = (max(ok, key=lambda g: (g.passed, sum(g.taus.values()))) if ok
-                    else min(gates, key=lambda g: (g.bound, -g.passed)))
+            if scope and stop_budget is not None:
+                objective = lambda g: (g.passed - g.errors - g.wrong_stops, sum(g.taus.values()))
+            else:
+                objective = lambda g: (g.useful, -g.wrong_stops, sum(g.taus.values()))
+            # Nothing certifiable: show the gate closest to certification among those that respect the stop
+            # budget (if any do), so the report never recommends a gate that silently drops what it must keep.
+            stop_ok = [g for g in gates if stop_budget is None or g.stop_bound <= stop_budget] or gates
+            best = max(ok, key=objective) if ok else min(stop_ok, key=lambda g: (g.bound, -g.useful))
             table.append((candidate.name, best, bool(ok)))
-        # Certified candidates first, then most decisions passed, then lowest bound.
-        name, gate, certified = max(table, key=lambda row: (row[2], row[1].passed if row[2] else -row[1].bound))
+        # Certified candidates first, then most correct in-scope decisions, then lowest bound.
+        name, gate, certified = max(table, key=lambda row: (row[2], row[1].useful if row[2] else -row[1].bound))
         chosen = next(c for c in step.candidates if c.name == name)
         names = list(preds_by)
         correlations = {(a, b): error_correlation(preds_by[a], preds_by[b])
@@ -307,6 +403,7 @@ class CompiledChain:
     backend: Backend
     error_budget: float
     confidence: float
+    priors: dict[str, dict[Any, float]] = field(default_factory=dict)
 
     def run(self, raw: Any) -> Decision:
         decision = Decision.pure(raw)
@@ -350,25 +447,40 @@ class CompiledChain:
                  f"Chain error budget **{self.error_budget:.2%}** silent errors at {self.confidence:.0%} confidence, "
                  f"split over {len(self.results)} neural step(s) "
                  f"({next(iter(self.results.values())).budget:.3%} each). Symbolic steps are exact.", "",
-                 "| step | type | formulation | gate τ | decided | silent errors | rate | 95% bound | budget | status |",
-                 "|---|---|---|---|---|---|---|---|---|---|"]
+                 *([f"Rates and coverage are reweighted to the production label mix "
+                    f"({'; '.join(f'{k}: ' + ', '.join(f'{v}={p:.0%}' for v, p in d.items()) for k, d in self.priors.items())}); "
+                    f"bounds use the effective sample size of the decided examples (ESS).", ""] if self.priors else []),
+                 "Silent errors are confident wrong answers within each step's budget scope; for steps budgeted "
+                 "on `continue`, that means wrong answers that let the chain continue, while confident wrong stops "
+                 "are counted separately as missed automation.", "",
+                 "| step | type | formulation | gate τ | decided | correct in scope | silent errors | rate | 95% bound | budget | wrong stops | status |",
+                 "|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for step in self.spec:
             if isinstance(step, (Guard, Map)):
-                lines.append(f"| {step.name} | symbolic | exact rule | | | 0 | 0 | 0 | 0 | exact |")
+                lines.append(f"| {step.name} | symbolic | exact rule | | | | 0 | 0 | 0 | 0 | | exact |")
                 continue
             r = self.results[step.name]
             g = r.gate
-            status = "certified" if r.certified else f"UNCERTIFIED: needs ≥{samples_needed(r.budget, self.confidence):,} decided, 0 errors"
-            lines.append(f"| {step.name} | neural · {step.kind} | {r.chosen.name} | {g.describe()} | {g.passed}/{g.n} "
-                         f"({g.coverage:.0%}) | {g.errors} | {g.rate:.2%} | {g.bound:.2%} | {r.budget:.2%} | {status} |")
+            unit = "continued (accepted) decisions" if step.budget_on == "continue" else "decided"
+            status = "certified" if r.certified else f"UNCERTIFIED: needs ≥{samples_needed(r.budget, self.confidence):,} {unit}, 0 errors"
+            if g.ess is not None:
+                status += f" (ESS {g.ess:.0f})"
+            if step.budget_on == "continue":
+                stop_note = f"; missed {g.stop_rate:.1%} of should-continue, bound {g.stop_bound:.1%}"
+                status += stop_note + (f" vs {step.stop_budget:.0%}" if step.stop_budget is not None else "")
+            scope = f" (on {step.budget_on})" if step.budget_on != "all" else ""
+            lines.append(f"| {step.name} | neural · {step.kind}{scope} | {r.chosen.name} | {g.describe()} | {g.passed}/{g.n} "
+                         f"({g.coverage:.0%}) | {g.useful} | {g.errors} | {g.rate:.2%} | {g.bound:.2%} | {r.budget:.2%} | "
+                         f"{g.wrong_stops} | {status} |")
         lines += ["", f"**Whole chain:** silent-error bound {self.chain_bound():.2%} "
                       f"({'within' if self.chain_bound() <= self.error_budget else 'over'} the {self.error_budget:.2%} budget). "
                       f"Chain {'CERTIFIED' if self.certified() else 'NOT certified'}.", ""]
         for r in self.results.values():
             lines += [f"## {r.step.name}: formulations tried", "",
-                      "| formulation | gate τ | decided | silent errors | 95% bound | fits budget |", "|---|---|---|---|---|---|"]
-            lines += [f"| {name}{' ← chosen' if name == r.chosen.name else ''} | {g.describe()} | {g.passed}/{g.n} | {g.errors} | "
-                      f"{g.bound:.2%} | {'yes' if ok else 'no'} |" for name, g, ok in r.table]
+                      "| formulation | gate τ | decided | correct in scope | silent errors | 95% bound | wrong stops | fits budget |",
+                      "|---|---|---|---|---|---|---|---|"]
+            lines += [f"| {name}{' ← chosen' if name == r.chosen.name else ''} | {g.describe()} | {g.passed}/{g.n} | {g.useful} | "
+                      f"{g.errors} | {g.bound:.2%} | {g.wrong_stops} | {'yes' if ok else 'no'} |" for name, g, ok in r.table]
             if r.correlations:
                 lines += ["", "Error correlation between formulations (φ; near 1 means they fail on the same inputs, "
                               "so voting between them buys little):", ""]
@@ -387,7 +499,10 @@ class CompiledChain:
         for name, r in self.results.items():
             labeled = [e for e in examples if name in e.labels]
             probs = [ask(r.chosen, r.step, e.input, self.backend, cache, e.id) for e in labeled]
-            g = gate_stats(predictions(probs, [e.labels[name] for e in labeled]), r.gate.taus, self.confidence)
+            truths = [e.labels[name] for e in labeled]
+            scope = r.step.continue_options() if r.step.budget_on == "continue" else None
+            g = gate_stats(predictions(probs, truths, prior_weights(truths, self.priors.get(name))),
+                           r.gate.taus, self.confidence, None, scope)
             bounds.append(g.bound)
             lines.append(f"| {name} | {r.chosen.name} | {g.describe()} | {g.passed}/{g.n} ({g.coverage:.0%}) | {g.errors} | "
                          f"{g.rate:.2%} | {g.bound:.2%} | {r.budget:.2%} | {'yes' if g.bound <= r.budget else 'NO'} |")

@@ -115,3 +115,53 @@ def test_asymmetric_gates_pass_more_when_one_answer_is_less_reliable():
     assert not sym.certified and sym.gate.passed == 150
     assert asym.certified and asym.gate.passed == 650 and asym.gate.errors == 0
     assert asym.gate.tau_for("true") < asym.gate.tau_for("false")
+
+
+def test_prior_reweighting_exposes_errors_hidden_by_a_balanced_sample():
+    # Balanced calibration sample: 500 positives (all right, p=0.97) and 500 negatives, of which 10 are
+    # confidently called positive. Among passed "yes" decisions that's 10/510 ≈ 2% on the sample, but at a
+    # 6% production prior the same false-positive rate means ~15% of auto-accepted "yes" are wrong.
+    inputs = [f"d{i}" for i in range(1000)]
+    truth = {d: i < 500 for i, d in enumerate(inputs)}
+    p = {d: 0.97 if (i < 500 or i < 510) else 0.03 for i, d in enumerate(inputs)}
+    backend = noul_backend(p)
+    examples = [Example(d, d, {"is_x": truth[d]}) for d in inputs]
+    spec = [NeuralStep("is_x", "noul", [plain()])]
+    flat = Compiler(spec, backend, asymmetric=True).compile(examples, 0.5).results["is_x"].gate
+    prod = Compiler(spec, backend, asymmetric=True).compile(examples, 0.5, priors={"is_x": {True: 0.06, False: 0.94}}).results["is_x"].gate
+    assert flat.rate < 0.011                     # 10 errors in 1000 decided
+    assert prod.ess is not None and prod.ess < 1000
+    assert prod.rate > flat.rate                 # reweighting surfaces the hidden false-positive cost
+
+
+def test_continue_budget_avoids_the_base_rate_trap():
+    # 6% positives. "nay" says a confident no to everything: under budget_on="all" at the production mix its
+    # only errors are the rare positives, so it looks great while continuing nothing. "good" finds positives.
+    inputs = [f"d{i}" for i in range(1000)]
+    truth = {d: i < 60 for i, d in enumerate(inputs)}
+    nay = noul_backend({d: 0.02 for d in inputs})
+    good = noul_backend({d: 0.97 if truth[d] else 0.03 for d in inputs})
+    examples = [Example(d, d, {"is_x": truth[d]}) for d in inputs]
+    cands = [Candidate("nay", plain().build, backend=nay), Candidate("good", plain().build, backend=good)]
+    on_all = Compiler([NeuralStep("is_x", "noul", cands)], good).compile(examples, 0.10).results["is_x"]
+    on_continue = Compiler([NeuralStep("is_x", "noul", cands, budget_on="continue")], good).compile(examples, 0.10).results["is_x"]
+    nay_all = next(g for name, g, _ in on_all.table if name == "nay")
+    assert nay_all.errors == 60 and nay_all.rate == 0.06   # 6% "error" passes a 10% budget...
+    assert on_continue.chosen.name == "good"                  # ...but continues nothing; scoped budget picks good
+    assert on_continue.gate.useful == 60 and on_continue.gate.errors == 0
+
+
+def test_stop_budget_is_a_miss_rate_and_holds_under_any_class_mix():
+    # 100 positives: 70 confident yes (right), 30 confident no (wrongly stopped). 900 negatives, all sure no.
+    # Missing 30% of positives must fail a 10% stop budget whatever the mix; per-stop it would look like 3%.
+    inputs = [f"d{i}" for i in range(1000)]
+    truth = {d: i < 100 for i, d in enumerate(inputs)}
+    p = {d: (0.97 if i < 70 else 0.03) if i < 100 else 0.03 for i, d in enumerate(inputs)}
+    backend = noul_backend(p)
+    examples = [Example(d, d, {"is_x": truth[d]}) for d in inputs]
+    step = NeuralStep("is_x", "noul", [plain()], budget_on="continue", stop_budget=0.10)
+    for priors in (None, {"is_x": {True: 0.5, False: 0.5}}):
+        result = Compiler([step], backend, asymmetric=True).compile(examples, 0.05, priors=priors).results["is_x"]
+        g = result.gate
+        assert g.wrong_stops == 0                      # the certified gate blocks the unreliable no's instead
+        assert g.useful == 70 and g.tau_for("false") > 0.97

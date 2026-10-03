@@ -321,3 +321,40 @@ Real-data gain is modest (+4 decisions per budget). The direction matches E0: th
 bound of 3.87%** (in-sample; held-out verification on `test_bal` is queued).
 The pair search was made fast enough to use (27 s → 0.2 s on 1,000 examples) by skipping
 the exact bound whenever the observed rate already exceeds the budget, and caching bounds.
+
+### C3 · Three ways the compiler's error accounting was wrong, and the fixes
+
+Running the compiler under realistic conditions exposed three accounting traps. Each is now
+handled, with a test that reproduces it (16 compiler + monad tests pass).
+
+1. **Sample mix ≠ production mix.** bal120 is 50% invoices; real intake is ~6%. Error rates
+   measured on the sample don't transfer. Fix: `compile(..., priors={"is_invoice": {True: 1/16,
+   False: 15/16}})` reweights examples to the production mix; bounds use the Kish effective
+   sample size, so few heavily-weighted examples give wide bounds. Effect on bal120: the 5%
+   certification from C2 is lost (ESS ~41, bound 3.9% → 7.1%), which is the honest answer:
+   more non-invoice examples are needed.
+2. **Base-rate trap.** Counting every confident wrong answer the same, under the production mix
+   the compiler picked v3 at τ=0.53 with 100% coverage: missing invoices barely moves an error
+   rate when invoices are 1 in 16. Fix: `NeuralStep(budget_on="continue")` budgets only wrong
+   answers that **continue** the chain (a false "yes" flowing toward payment), and the objective
+   becomes correct continues (invoices actually processed).
+3. **Wrong denominator for stops.** A wrong "no" silently drops an invoice. Measured per stop
+   decision it looked like 2.2%; it was 21 of 61 invoices (34%). Fix: `stop_budget` is a
+   **miss rate**, the share of should-continue inputs confidently stopped, which is
+   class-conditional and so doesn't depend on the mix. The gate then maximises everything
+   decided without review subject to both budgets; the uncertified fallback also respects the
+   stop budget.
+
+**`is_invoice` on bal120, with false-continue budget ε and stop (miss) budget 10%,
+production mix:**
+
+| ε | gates | chosen | gate | decided | accepted invoices | false accepts | bound | missed invoices | status |
+|---|---|---|---|---|---|---|---|---|---|
+| 1% | yes/no | vote(v1,v2,v3) | yes ≥0.50 / no ≥0.75 | 73% | 40 | 0 | 7.22% | 2 (3.3%) | needs ≥299 accepted, 0 errors |
+| 10% | one | v4_evidence | 0.655 | 66% | 40 | 0 | 7.22% | 2 (3.3%) | certified |
+| 10% | yes/no | vote(v1,v2,v3) | yes ≥0.50 / no ≥0.75 | 73% | 40 | 0 | 7.22% | 2 (3.3%) | certified |
+
+Reading: 40 of 61 invoices can be accepted automatically with zero false accepts; 2 invoices
+are confidently (and wrongly) rejected; the rest go to review. Certifying a 1% false-accept
+rate needs ≥299 accepted invoices with zero errors, about 7x the current calibration data.
+The sample-mix and production-mix runs now agree, as a class-conditional accounting should.
