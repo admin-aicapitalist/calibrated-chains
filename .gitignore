@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+models/
+.cache/
+.env
+.pytest_cache/
+data/
+experiments/runs/.model.lock
