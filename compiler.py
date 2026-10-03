@@ -25,6 +25,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
@@ -32,6 +33,7 @@ from clef_monad import Backend, Decision, Entry, Step, band
 
 Request = dict[str, Any]  # SystemOne request body: {"state": ..., "questions": {...}}
 TAUS = [round(0.5 + i * 0.005, 3) for i in range(100)]  # 0.500 ... 0.995
+PAIR_TAUS = [round(0.5 + i * 0.01, 2) for i in range(50)]  # coarser grid for per-answer (yes/no) gates
 
 
 # --- chain spec --------------------------------------------------------------------------------------
@@ -142,6 +144,7 @@ def ask(candidate: Candidate, step: NeuralStep, raw: Any, backend: Backend,
 
 # --- statistics ----------------------------------------------------------------------------------------
 
+@lru_cache(maxsize=None)
 def upper_bound(errors: int, n: int, confidence: float = 0.95) -> float:
     """One-sided Clopper-Pearson upper bound on an error rate (k errors in n)."""
     if n == 0:
@@ -173,7 +176,7 @@ def samples_needed(epsilon: float, confidence: float = 0.95) -> int:
 
 @dataclass
 class GateStats:
-    tau: float
+    taus: dict[str, float]  # per predicted option; "*" applies to every option
     n: int  # labeled examples
     passed: int
     errors: int  # wrong AND passed
@@ -187,12 +190,32 @@ class GateStats:
     def rate(self) -> float:
         return self.errors / self.passed if self.passed else 0.0
 
+    def tau_for(self, option: str) -> float:
+        return self.taus.get(option, self.taus.get("*", 1.0))
 
-def gate_stats(preds: list[tuple[str, float, bool]], tau: float, confidence: float) -> GateStats:
-    """preds: (predicted option, its probability, correct?)."""
-    passed = [ok for _, conf, ok in preds if conf >= tau]
+    @property
+    def tau(self) -> float:
+        """Display value: the single threshold, or the strictest one."""
+        return max(self.taus.values())
+
+    def describe(self) -> str:
+        if "*" in self.taus:
+            return f"{self.taus['*']:.3f}"
+        return " / ".join(f"{o} ≥{t:.2f}" for o, t in self.taus.items())
+
+
+def gate_stats(preds: list[tuple[str, float, bool]], taus: dict[str, float] | float, confidence: float,
+               budget: float | None = None) -> GateStats:
+    """preds: (predicted option, its probability, correct?). A decision passes if its probability clears the
+    threshold for the option it predicts. With ``budget``, the exact bound is skipped (reported as 1.0)
+    when the observed rate alone already exceeds it, since the bound is never below the rate."""
+    taus = {"*": taus} if isinstance(taus, (int, float)) else taus
+    probe = GateStats(taus, 0, 0, 0, 0)
+    passed = [ok for option, conf, ok in preds if conf >= probe.tau_for(option)]
     errors = sum(1 for ok in passed if not ok)
-    return GateStats(tau, len(preds), len(passed), errors, upper_bound(errors, len(passed), confidence))
+    if budget is not None and passed and errors / len(passed) > budget:
+        return GateStats(taus, len(preds), len(passed), errors, 1.0)
+    return GateStats(taus, len(preds), len(passed), errors, upper_bound(errors, len(passed), confidence))
 
 
 def predictions(probs: list[dict[str, float]], truths: list[Any]) -> list[tuple[str, float, bool]]:
@@ -231,9 +254,12 @@ class StepResult:
 
 
 class Compiler:
+    """``asymmetric=True`` lets yes/no steps gate "yes" and "no" at different thresholds, for models whose
+    two answers aren't equally trustworthy."""
+
     def __init__(self, spec: list[NeuralStep | Guard | Map], backend: Backend,
-                 cache_path: Path | None = None, confidence: float = 0.95):
-        self.spec, self.backend, self.confidence = spec, backend, confidence
+                 cache_path: Path | None = None, confidence: float = 0.95, asymmetric: bool = False):
+        self.spec, self.backend, self.confidence, self.asymmetric = spec, backend, confidence, asymmetric
         self.cache = AnswerCache(cache_path)
 
     def neural_steps(self) -> list[NeuralStep]:
@@ -252,11 +278,18 @@ class Compiler:
         for candidate in step.candidates:
             probs = [ask(candidate, step, e.input, self.backend, self.cache, e.id) for e in labeled]
             preds = preds_by[candidate.name] = predictions(probs, truths)
-            gates = [gate_stats(preds, tau, self.confidence) for tau in TAUS]
+            if self.asymmetric and step.kind == "noul":
+                gates = [gate_stats(preds, {"true": ty, "false": tn}, self.confidence, budget)
+                         for ty in PAIR_TAUS for tn in PAIR_TAUS]
+            else:
+                gates = [gate_stats(preds, tau, self.confidence) for tau in TAUS]
             ok = [g for g in gates if g.passed and g.bound <= budget]
-            # Among gates passing the same decisions, take the highest tau: a lower one would also pass
+            if not ok and any(g.bound == 1.0 and g.passed for g in gates):  # fill skipped bounds for the report
+                gates = [g if g.bound < 1.0 or not g.passed else gate_stats(preds, g.taus, self.confidence) for g in gates]
+            # Among gates passing the same decisions, take the strictest: a looser one would also pass
             # confidence levels the calibration data never showed, which nothing here has certified.
-            best = max(ok, key=lambda g: (g.passed, g.tau)) if ok else min(gates, key=lambda g: (g.bound, -g.passed))
+            best = (max(ok, key=lambda g: (g.passed, sum(g.taus.values()))) if ok
+                    else min(gates, key=lambda g: (g.bound, -g.passed)))
             table.append((candidate.name, best, bool(ok)))
         # Certified candidates first, then most decisions passed, then lowest bound.
         name, gate, certified = max(table, key=lambda row: (row[2], row[1].passed if row[2] else -row[1].bound))
@@ -294,8 +327,9 @@ class CompiledChain:
             option = max(probs, key=probs.__getitem__)
             confidence = probs[option]
             value = (option == "true") if step.kind == "noul" else option
-            detail = f"{result.chosen.name}: {option} (p={confidence:.2f}, gate {result.gate.tau:.3f})"
-            if confidence < result.gate.tau:
+            tau = result.gate.tau_for(option)
+            detail = f"{result.chosen.name}: {option} (p={confidence:.2f}, gate {tau:.3f})"
+            if confidence < tau:
                 return Decision.fail(f"Confidence too low ({band(confidence)}, {confidence:.0%}) at {step.name}",
                                      Entry("bind", step.name, "failed", detail, confidence))
             if (step.kind == "noul" and value != step.expect) or (step.allowed and value not in step.allowed):
@@ -325,7 +359,7 @@ class CompiledChain:
             r = self.results[step.name]
             g = r.gate
             status = "certified" if r.certified else f"UNCERTIFIED: needs ≥{samples_needed(r.budget, self.confidence):,} decided, 0 errors"
-            lines.append(f"| {step.name} | neural · {step.kind} | {r.chosen.name} | {g.tau:.3f} | {g.passed}/{g.n} "
+            lines.append(f"| {step.name} | neural · {step.kind} | {r.chosen.name} | {g.describe()} | {g.passed}/{g.n} "
                          f"({g.coverage:.0%}) | {g.errors} | {g.rate:.2%} | {g.bound:.2%} | {r.budget:.2%} | {status} |")
         lines += ["", f"**Whole chain:** silent-error bound {self.chain_bound():.2%} "
                       f"({'within' if self.chain_bound() <= self.error_budget else 'over'} the {self.error_budget:.2%} budget). "
@@ -333,7 +367,7 @@ class CompiledChain:
         for r in self.results.values():
             lines += [f"## {r.step.name}: formulations tried", "",
                       "| formulation | gate τ | decided | silent errors | 95% bound | fits budget |", "|---|---|---|---|---|---|"]
-            lines += [f"| {name}{' ← chosen' if name == r.chosen.name else ''} | {g.tau:.3f} | {g.passed}/{g.n} | {g.errors} | "
+            lines += [f"| {name}{' ← chosen' if name == r.chosen.name else ''} | {g.describe()} | {g.passed}/{g.n} | {g.errors} | "
                       f"{g.bound:.2%} | {'yes' if ok else 'no'} |" for name, g, ok in r.table]
             if r.correlations:
                 lines += ["", "Error correlation between formulations (φ; near 1 means they fail on the same inputs, "
@@ -353,9 +387,9 @@ class CompiledChain:
         for name, r in self.results.items():
             labeled = [e for e in examples if name in e.labels]
             probs = [ask(r.chosen, r.step, e.input, self.backend, cache, e.id) for e in labeled]
-            g = gate_stats(predictions(probs, [e.labels[name] for e in labeled]), r.gate.tau, self.confidence)
+            g = gate_stats(predictions(probs, [e.labels[name] for e in labeled]), r.gate.taus, self.confidence)
             bounds.append(g.bound)
-            lines.append(f"| {name} | {r.chosen.name} | {g.tau:.3f} | {g.passed}/{g.n} ({g.coverage:.0%}) | {g.errors} | "
+            lines.append(f"| {name} | {r.chosen.name} | {g.describe()} | {g.passed}/{g.n} ({g.coverage:.0%}) | {g.errors} | "
                          f"{g.rate:.2%} | {g.bound:.2%} | {r.budget:.2%} | {'yes' if g.bound <= r.budget else 'NO'} |")
         chain = 1 - math.prod(1 - b for b in bounds)
         lines += ["", f"**Whole chain on held-out data:** silent-error bound {chain:.2%} vs budget {self.error_budget:.2%}."]
@@ -364,6 +398,6 @@ class CompiledChain:
     def to_json(self) -> dict[str, Any]:
         """The compiled artifact: what production needs to load alongside the spec."""
         return {"error_budget": self.error_budget, "confidence": self.confidence, "steps": {
-            name: {"formulation": r.chosen.name, "tau": r.gate.tau, "decided": r.gate.passed, "n": r.gate.n,
+            name: {"formulation": r.chosen.name, "gate": r.gate.taus, "decided": r.gate.passed, "n": r.gate.n,
                    "errors": r.gate.errors, "bound": r.gate.bound, "budget": r.budget, "certified": r.certified}
             for name, r in self.results.items()}}

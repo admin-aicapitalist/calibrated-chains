@@ -55,6 +55,11 @@ def sample(name: str) -> pd.DataFrame:
         invoices = df[df.is_invoice].sample(60, random_state=0)
         others = df[~df.is_invoice].groupby("category", group_keys=False).sample(4, random_state=0)
         return pd.concat([invoices, others]).sort_index()
+    if name == "test_bal":
+        # Held-out verification set: every test invoice + 8 docs from each of the 15 other classes.
+        df = load("test")
+        others = df[~df.is_invoice].groupby("category", group_keys=False).sample(8, random_state=0)
+        return pd.concat([df[df.is_invoice], others]).sort_index()
     if name == "dev10":
         return load("validation").groupby("category", group_keys=False).sample(frac=0.1, random_state=0).sort_index()
     if name == "dev":

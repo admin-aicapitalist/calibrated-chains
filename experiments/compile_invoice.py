@@ -1,6 +1,7 @@
 """Compile the is_invoice step from every formulation measured so far, using cached experiment outputs.
 
-    uv run python -m experiments.compile_invoice bal120 0.01 0.10
+    uv run python -m experiments.compile_invoice bal120 0.01 0.10                # compile only
+    uv run python -m experiments.compile_invoice bal120:test_bal 0.01 0.10       # compile, then verify held-out
 
 Candidates are the experiment variants (and ensembles of them) that have a complete run on the sample.
 Their answers are seeded into the compiler's cache from experiments/runs, so compiling never calls the
@@ -60,48 +61,65 @@ def no_model(state, questions):
     raise RuntimeError("compile_invoice runs from cached outputs only; run the variant first")
 
 
-def main(sample_name: str, budgets: list[float]) -> None:
-    texts = load("validation").set_index("doc_id").text
+def load_sample(sample_name: str, cache: AnswerCache) -> tuple[list[Example], list[str]]:
+    """Examples for every doc that all complete text runs on this sample share; seeds the cache."""
+    texts = {}
+    for split in ("validation", "test"):
+        texts |= load(split).set_index("doc_id").text.to_dict()
     fixes = corrections()
-    cache = AnswerCache(None)
-    available = []
     rows_by = {}
     for variant in SINGLES:
         path = run_path(variant, sample_name)
-        rows = [json.loads(line) for line in path.open()] if path.exists() else []
-        if not rows or VARIANTS.get(variant) is None:
-            continue
-        rows_by[variant] = {r["doc_id"]: r for r in rows}
-        available.append(variant)
+        if path.exists() and not getattr(VARIANTS[variant], "needs_image", False):
+            rows_by[variant] = {r["doc_id"]: r for r in map(json.loads, path.open())}
+    if not rows_by:
+        return [], []
     n = max(len(r) for r in rows_by.values())
-    available = [v for v in available if len(rows_by[v]) == n]  # complete runs only
+    available = [v for v in rows_by if len(rows_by[v]) == n]
     ids = sorted(rows_by[available[0]])
-    examples = [Example(i, texts[i], {STEP: fixes.get(i, rows_by[available[0]][i]["category"] == "invoice")}) for i in ids]
     for variant in available:
         for i in ids:
-            if getattr(VARIANTS[variant], "needs_image", False):
-                continue  # image variants can't be rebuilt from text alone; seeded by key below
             p = p_invoice(rows_by[variant][i], variant)
             cache.data[AnswerCache.key(STEP, variant, i, VARIANTS[variant](texts[i]))] = {"true": p, "false": 1 - p}
+    labels = {i: fixes.get(i, rows_by[available[0]][i]["category"] == "invoice") for i in ids}
+    return [Example(i, texts[i], {STEP: labels[i]}) for i in ids], available
 
-    singles = [candidate(v) for v in available if not getattr(VARIANTS[v], "needs_image", False)]
+
+def main(samples: str, budgets: list[float]) -> None:
+    calib_name, _, verify_name = samples.partition(":")
+    cache = AnswerCache(None)
+    examples, available = load_sample(calib_name, cache)
+    held_out, verifiable = load_sample(verify_name, cache) if verify_name else ([], [])
+    singles = [candidate(v) for v in available]
     by_name = {c.name: c for c in singles}
     votes = [ensemble(name, *(by_name[m] for m in members)) for name, members in ENSEMBLES.items()
              if all(m in by_name for m in members)]
     spec = [NeuralStep(STEP, "noul", singles + votes)]
 
-    out = [f"# Compiling `{STEP}` on {sample_name}", "",
-           f"{len(examples)} labeled docs (audited labels), {len(singles)} single formulations, {len(votes)} ensembles. "
-           f"Skipped (no complete text run yet): {', '.join(v for v in SINGLES if v not in by_name) or 'none'}.", ""]
-    for budget in budgets:
-        compiler = Compiler(spec, backend=no_model)
+    out = [f"# Compiling `{STEP}` on {calib_name}" + (f", verifying on {verify_name}" if verify_name else ""), "",
+           f"{len(examples)} labeled calibration docs (audited labels), {len(singles)} single formulations, "
+           f"{len(votes)} ensembles. Not available as text runs on {calib_name}: "
+           f"{', '.join(v for v in SINGLES if v not in by_name) or 'none'}.", ""]
+    if verify_name:
+        out += [f"Held-out {verify_name}: {len(held_out)} docs; formulations with runs there: {', '.join(verifiable)}.", ""]
+    for budget, asymmetric in [(b, a) for b in budgets for a in (False, True)]:
+        compiler = Compiler(spec, backend=no_model, asymmetric=asymmetric)
         compiler.cache = cache
         compiled = compiler.compile(examples, error_budget=budget)
-        out += [f"## Budget {budget:.0%}", "", compiled.report().replace("# Calibration report", "### Report"), "",
-                "```json", json.dumps(compiled.to_json(), indent=2), "```", ""]
+        mode = "separate yes/no gates" if asymmetric else "one gate"
+        out += [f"## Budget {budget:.0%}, {mode}", "", compiled.report().replace("# Calibration report", "### Report"), ""]
+        if verify_name:
+            chosen = compiled.results[STEP].chosen
+            members = [m.name for m in chosen.members] or [chosen.name]
+            if all(m in verifiable for m in members):
+                out += [compiled.verify(held_out, cache).replace("# Verification", "### Verification"), ""]
+            else:
+                out += [f"### Verification: skipped, {chosen.name} has no complete run on {verify_name} yet", ""]
+        out += ["```json", json.dumps(compiled.to_json(), indent=2), "```", ""]
     text = "\n".join(out)
     RESULTS.mkdir(exist_ok=True)
-    (RESULTS / f"compile__{STEP}__{sample_name}.md").write_text(text)
+    suffix = f"{calib_name}" + (f"__verify_{verify_name}" if verify_name else "")
+    (RESULTS / f"compile__{STEP}__{suffix}.md").write_text(text)
     print(text)
 
 

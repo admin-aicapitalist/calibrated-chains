@@ -91,3 +91,27 @@ def test_ensemble_averages_members_and_cache_avoids_repeat_calls(tmp_path):
 def test_error_correlation():
     a = [("x", 0.9, ok) for ok in (True, False, True, False)]
     assert math.isclose(error_correlation(a, a), 1.0)
+
+
+def test_asymmetric_gates_pass_more_when_one_answer_is_less_reliable():
+    # "yes" answers at p=0.85 are always right. "no" answers at confidence 0.90 are wrong 3 times in 7;
+    # "no" answers at confidence 0.98 are always right. One symmetric tau must exceed 0.90 to block the
+    # noisy no's, which also blocks every yes; separate thresholds keep both the yes's and the sure no's.
+    inputs = [f"d{i}" for i in range(1000)]
+    truth, p = {}, {}
+    for i, d in enumerate(inputs):
+        if i < 500:
+            truth[d], p[d] = True, 0.85
+        elif i % 10 < 3:
+            truth[d], p[d] = False, 0.02
+        else:
+            truth[d], p[d] = (i % 10 < 6), 0.10
+    backend = noul_backend(p)
+    examples = [Example(d, d, {"is_x": truth[d]}) for d in inputs]
+    spec = [NeuralStep("is_x", "noul", [plain()])]
+    sym = Compiler(spec, backend).compile(examples, 0.01).results["is_x"]
+    asym = Compiler(spec, backend, asymmetric=True).compile(examples, 0.01).results["is_x"]
+    # Symmetric: only the 150 sure no's pass; 0 errors in 150 still bounds at ~2%, so it can't certify 1%.
+    assert not sym.certified and sym.gate.passed == 150
+    assert asym.certified and asym.gate.passed == 650 and asym.gate.errors == 0
+    assert asym.gate.tau_for("true") < asym.gate.tau_for("false")

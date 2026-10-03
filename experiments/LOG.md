@@ -296,3 +296,28 @@ The manual process from E0-E4 is now a library (`compiler.py`, 7 tests in
 The compiler reproduces the manual conclusions (v4 best at tight budgets, v0/v3 worst) and adds
 the part the manual process lacked: an explicit statement of what can and can't be claimed from
 the data. At 1% the answer is "not yet: get ≥299 decided examples".
+
+### C2 · Separate yes/no gates (compiler option `asymmetric=True`)
+
+E0 showed Clef's "yes" and "no" aren't equally trustworthy, yet the gate used one τ for both. The
+compiler can now gate each answer of a yes/no step separately (τ_yes, τ_no searched on a 0.01 grid,
+strictest pair among equals). A synthetic test shows the extreme case: when yes's are reliable at
+0.85 but no's are noisy below 0.98, one gate can only pass the 150 sure no's (bound 1.98%, not
+certifiable at 1%), while separate gates pass 650 with 0 errors (bound 0.46%, certified).
+
+On bal120 (`is_invoice`, all formulations, audited labels):
+
+| budget | gates | chosen | gate | decided | errors | 95% bound | status |
+|---|---|---|---|---|---|---|---|
+| 1% | one | v4_evidence | 0.745 | 72/120 (60%) | 0 | 4.08% | needs ≥299 decided |
+| 1% | yes/no | v4_evidence | yes ≥0.66 / no ≥0.75 | 76/120 (63%) | 0 | 3.87% | needs ≥299 decided |
+| **5%** | **yes/no** | **v4_evidence** | **yes ≥0.66 / no ≥0.75** | **76/120 (63%)** | **0** | **3.87%** | **certified** |
+| 10% | one | v2_framing | 0.615 | 90/120 (75%) | 4 | 9.88% | certified |
+| 10% | yes/no | v2_framing | yes ≥0.62 / no ≥0.58 | 94/120 (78%) | 4 | 9.47% | certified |
+
+Real-data gain is modest (+4 decisions per budget). The direction matches E0: the compiler gates
+"yes" lower than "no" because Clef's yes is the more reliable answer. First certified result:
+**at a 5% budget, `is_invoice` decides 63% of documents automatically with 0 errors and a 95%
+bound of 3.87%** (in-sample; held-out verification on `test_bal` is queued).
+The pair search was made fast enough to use (27 s → 0.2 s on 1,000 examples) by skipping
+the exact bound whenever the observed rate already exceeds the budget, and caching bounds.
