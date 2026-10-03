@@ -202,3 +202,97 @@ Hypothesis: contrastive alternatives (budget, form, ...) calibrate better than a
 **Decision:** keep the yes/no-with-criteria formulation (v2) as the primary decision. The 16-way
 type question goes into v4 only as an extra *signal* for the combination strategies, not as the
 decision.
+
+### E-MJ · Does multi-judge voting buy 9s? (offline, from E0-E3 outputs)
+
+Question: if several formulations act as "judges", does majority voting cut errors the way
+Condorcet's jury theorem promises (1 judge 95% → 3 judges 99% → ...)? The theorem assumes
+**independent** errors. Repeating the *same* Clef call gives identical answers (one deterministic
+forward pass), so the only cheap source of diversity is different formulations. Measured on
+bal120 with audited labels:
+
+| judge | error rate (threshold 0.5) |
+|---|---|
+| v0_baseline | 0.317 |
+| v1_criteria | 0.167 |
+| **v2_framing** | **0.142** |
+| v3_choice16 | 0.200 |
+
+Error correlation (φ) between judges: 0.34-0.78; v1/v2 0.72, v1/v3 0.78. 14 of v2's 17 errors
+are also v1 errors.
+
+| ensemble | majority error | mean-prob error | AUROC |
+|---|---|---|---|
+| v1 + v2 + v3 | **0.167** | 0.175 | 0.952 |
+| v0 + v1 + v2 | 0.167 | 0.225 | 0.954 |
+| all four | 0.167 | 0.200 | 0.952 |
+| *Condorcet prediction if v1, v2, v3 were independent* | *0.076* | | |
+
+**Finding:** voting across formulations of the same model is *worse* than the best single
+judge (0.167 vs 0.142), because the errors are correlated: the same hard docs (garbled OCR,
+debatable labels) fool every formulation. The Condorcet "each judge pair buys a 9" curve does
+not hold for prompt-level diversity. Multi-judge needs genuinely different models or inputs
+(Clef vs Jev, text vs image), and its gain has to be measured on labeled data, never assumed.
+Measured error correlation is therefore a first-class output of the compiler.
+
+**Second constraint on 9s:** certifying a silent-error rate ε at 95% confidence needs about
+3/ε gated decisions with zero errors (rule of three): 0.1% → ~3,000; 0.01% → ~30,000;
+0.001% → ~300,000 labeled decisions. With 29 auto-accepted invoices and 0 errors, the most we
+can claim today is ≤ 9.8%.
+
+### E4 · v4_evidence on bal120: type question + 5 factual sub-questions in one pass
+
+**Change:** v2's state and `is_invoice` question, plus in the same forward pass: `doc_type`
+(16-way) and five narrow nouls: `has_total_due`, `has_invoice_ref`, `requests_payment`,
+`has_line_items`, `is_purchase_order`. p_invoice is read from `is_invoice`. Prompt ~1.3k tokens,
+17.4 s/doc.
+
+| variant (audited labels) | recall | precision | AUROC | ECE | @τ=0.9 acc / false / missed | safe τ | safe acc / false |
+|---|---|---|---|---|---|---|---|
+| v2_framing | 0.803 | 0.907 | 0.954 | 0.097 | 23 / 0 / 0 | 0.820 | 29 / 0 |
+| **v4_evidence** | **0.918** | 0.862 | **0.955** | 0.112 | 23 / 0 / 0 | **0.745** | **35 / 0** |
+
+**Findings:**
+1. **Best formulation so far.** Asking the narrow questions alongside makes the `is_invoice`
+   answer itself better: recall 0.80 → 0.92, and the in-sample safe gate auto-accepts 35/61
+   invoices with 0 false (v2: 29).
+2. **Its errors are structurally different.** Error correlation with the other formulations:
+   φ = 0.03 (v0), 0.14 (v3), 0.33 (v1), 0.60 (v2), against 0.5-0.78 among v0-v3. The extra
+   questions change how the model reads the document, the first sign of the diversity
+   multi-judge needs.
+3. **Symbolic combination of the sub-answers doesn't help on 120 docs.** Mean of is_invoice and
+   doc_type: 10/60 auto-accepted; AND-agreement: 12/60; stacked logistic regression over all 7
+   answers (5-fold CV) overfits: 0/60 at a safe gate. The extra signals are useful *inside*
+   the forward pass, not as separate features at this sample size.
+
+### C1 · The calibration compiler (`compiler.py`)
+
+The manual process from E0-E4 is now a library (`compiler.py`, 7 tests in
+`tests/test_compiler.py`):
+
+- **Spec:** a chain of `NeuralStep` (with candidate formulations), `Guard` and `Map`.
+  A `Candidate` maps raw input → SystemOne request, can set its own backend (Clef or Jev), and
+  `ensemble(...)` averages members' probabilities (multi-judge as just another candidate).
+- **Calibrate:** per neural step, every candidate is scored on labeled examples; the gate τ is
+  the one that passes the most decisions while the **95% Clopper-Pearson upper bound** on
+  silent errors stays within the step's share of the budget (εᵢ = 1 − (1 − ε)^(1/m) for m
+  neural steps). Among gates passing the same decisions the highest τ wins, so the gate never
+  certifies confidence levels the data didn't show (a test caught the original lowest-τ rule
+  passing a 0.6 when all calibration data was at 0.99).
+- **Output:** a `CompiledChain` that runs through the `Decision` monad with the gates baked in,
+  a markdown calibration report (per step: formulation, τ, coverage, errors, bound, budget,
+  certified or the sample size needed; all candidates tried; pairwise error correlation),
+  `verify()` with frozen gates on held-out data, and a JSON artifact.
+- **Answers cached** per (step, candidate, example, request hash): recompiling never re-runs the model.
+
+**First compile, `is_invoice` on bal120** (5 formulations + 2 ensembles, from cached runs;
+[results/compile__is_invoice__bal120.md](results/compile__is_invoice__bal120.md)):
+
+| budget | chosen | τ | decided | silent errors | 95% bound | status |
+|---|---|---|---|---|---|---|
+| 1% | v4_evidence | 0.745 | 72/120 (60%) | 0 | 4.08% | UNCERTIFIED: needs ≥299 decided with 0 errors |
+| 10% | v2_framing | 0.615 | 90/120 (75%) | 4 | 9.88% | certified |
+
+The compiler reproduces the manual conclusions (v4 best at tight budgets, v0/v3 worst) and adds
+the part the manual process lacked: an explicit statement of what can and can't be claimed from
+the data. At 1% the answer is "not yet: get ≥299 decided examples".

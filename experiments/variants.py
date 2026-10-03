@@ -115,3 +115,52 @@ def v6_image_only(text: str, image: Any) -> dict[str, Any]:
     record["state"] = {"source": "A scanned paper business document from a 1980s-90s corporate archive (attached image)."}
     return record | {"images": [image]}
 
+
+
+# --- judges for multi-judge experiments (E-MJ2): same model, structurally different evidence or angle ---
+
+def _window(text: str, start: float, end: float) -> str:
+    words = text.split()
+    return " ".join(words[int(len(words) * start):max(int(len(words) * end), int(len(words) * start) + 1)])
+
+
+def _v2_on(text: str) -> dict[str, Any]:
+    return v2_framing(text)
+
+
+@variant
+def j_first70(text: str) -> dict[str, Any]:
+    """v2 formulation on the first 70% of the OCR words."""
+    return _v2_on(_window(text, 0.0, 0.7))
+
+
+@variant
+def j_last70(text: str) -> dict[str, Any]:
+    return _v2_on(_window(text, 0.3, 1.0))
+
+
+@variant
+def j_mid70(text: str) -> dict[str, Any]:
+    return _v2_on(_window(text, 0.15, 0.85))
+
+
+@variant
+def j_trim80(text: str) -> dict[str, Any]:
+    return _v2_on(_window(text, 0.1, 0.9))
+
+
+@variant
+def j_inverted(text: str) -> dict[str, Any]:
+    """Inverted angle: ask whether it is NOT an invoice; p_invoice = P(false)."""
+    return {"state": {"source": FRAMING, "ocr_text": text}, "questions": {"not_invoice": {
+        "type": "noul", "instructions": "Is this document something other than an invoice?",
+        "criteria": {"true": INVOICE_CRITERIA["false"], "false": INVOICE_CRITERIA["true"]}}}}
+
+
+@variant
+def j_clerk(text: str) -> dict[str, Any]:
+    """Role angle: would accounts payable book it as a vendor bill to pay?"""
+    return {"state": {"source": FRAMING, "ocr_text": text}, "questions": {"is_invoice": {
+        "type": "noul",
+        "instructions": "Would an accounts-payable clerk enter this document into the payables system as a vendor bill to pay?",
+        "criteria": INVOICE_CRITERIA}}}

@@ -27,6 +27,8 @@ def load_run(variant: str, sample_name: str, extract=None) -> tuple[np.ndarray, 
 def default_extract(row: dict) -> float:
     if "is_invoice" in row["answers"]:
         return prob(row, "is_invoice", "true")
+    if "not_invoice" in row["answers"]:
+        return prob(row, "not_invoice", "false")
     return prob(row, "doc_type", "invoice")
 
 
