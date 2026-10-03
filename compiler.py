@@ -112,6 +112,14 @@ def _probabilities(answer: dict) -> dict[str, float]:
     return dict(answer["probabilities"])
 
 
+
+def _stable(value: Any) -> str:
+    """JSON fallback for request contents: media hash by content (a PIL image's repr is its address)."""
+    if hasattr(value, "tobytes"):
+        return "media:" + hashlib.sha1(value.tobytes()).hexdigest()
+    return str(value)
+
+
 class AnswerCache:
     """JSONL cache: (step, candidate, example, request hash) -> option probabilities."""
 
@@ -124,8 +132,9 @@ class AnswerCache:
 
     @staticmethod
     def key(step: str, candidate: str, example_id: str, request: Request) -> str:
-        digest = hashlib.sha1(json.dumps(request, sort_keys=True, default=str).encode()).hexdigest()[:12]
+        digest = hashlib.sha1(json.dumps(request, sort_keys=True, default=_stable).encode()).hexdigest()[:12]
         return f"{step}|{candidate}|{example_id}|{digest}"
+
 
     def get(self, key: str) -> dict[str, float] | None:
         return self.data.get(key)

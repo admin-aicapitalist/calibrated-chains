@@ -358,3 +358,42 @@ Reading: 40 of 61 invoices can be accepted automatically with zero false accepts
 are confidently (and wrongly) rejected; the rest go to review. Certifying a 1% false-accept
 rate needs ≥299 accepted invoices with zero errors, about 7x the current calibration data.
 The sample-mix and production-mix runs now agree, as a class-conditional accounting should.
+
+### E5 · v5_image_text on bal120: add the original scan
+
+**Change:** v4's questions with the RVL-CDIP scan attached as an image (~750 vision tokens at
+native resolution) plus the OCR text. ~33 s/doc on CPU (v4: 17 s).
+
+| variant (audited labels) | recall | precision | AUROC | ECE | @τ=0.9 acc / false / missed | safe τ | safe acc / false |
+|---|---|---|---|---|---|---|---|
+| v4_evidence | 0.918 | 0.862 | 0.955 | 0.112 | 23 / 0 / 0 | 0.745 | 35 / 0 |
+| **v5_image_text** | 0.852 | **1.000** | **0.992** | 0.081 | **36 / 0 / 0** | 0.870 | **37 / 0** |
+| v5_image_text + platt(CV) | 0.918 | 0.949 | 0.988 | 0.045 | 52 / 0 / 1 | 0.875 | 53 / 0 |
+
+**Findings:**
+1. **The image fixes what OCR destroyed.** The two garbage-OCR invoices (validation/508, /338)
+   go from ~0.55 ("don't know", v4) to 0.92/0.93 (v5): the model reads the layout Tesseract lost.
+   AUROC 0.955 → 0.992, precision 1.000 with audited labels.
+2. **Modality diversity is the diversity multi-judge needs.** Error correlation v4 (text) vs v5
+   (image+text): **φ = 0.29**, against 0.5-0.78 between text rewordings (E-MJ). Only 4 docs
+   fool both. Averaging them cuts errors to 7, below the best single judge (9). Unlike prompt
+   rewording, different input modalities do give judges that vote usefully.
+
+### C4 · Compiling with images
+
+The compiler's answer cache hashed requests with `default=str`, which for an image is its memory
+address, so image requests never hit the cache. Media are now hashed by content. Candidates in
+`compile_invoice` take a doc id and build text or text+image requests from it.
+
+**`is_invoice` on bal120, production mix, false-accept budget ε, stop (miss) budget 10%:**
+
+| ε | gates | chosen | gate | decided | invoices accepted | false accepts | bound | missed | status |
+|---|---|---|---|---|---|---|---|---|---|
+| 5% | one | vote(v4,v5) | 0.690 | 80% | 47 / 61 | 0 | 6.18% | 2 | needs ≥59 accepted |
+| 5% | yes/no | **vote(v2,v5)** | yes ≥0.50 / no ≥0.70 | **82%** | **54 / 61** | **0** | **5.40%** | 2 | needs ≥59 accepted |
+| 10% | yes/no | vote(v2,v5) | yes ≥0.51 / no ≥0.70 | 82% | 54 / 61 | 0 | 5.40% | 2 | certified |
+
+Without being told, the compiler picks a text-judge + image-judge ensemble, the combination
+E5 identified as genuinely diverse. Against the text-only compile (C3): invoices accepted
+40 → 54, still 0 false accepts, bound 7.22% → 5.40%, a few more accepted invoices away from
+a 5% certification.

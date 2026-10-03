@@ -16,7 +16,7 @@ from pathlib import Path
 
 from compiler import AnswerCache, Candidate, Compiler, Example, NeuralStep, ensemble
 from experiments.compare import corrections
-from experiments.data import load
+from experiments.data import image, load
 from experiments.metrics import RESULTS
 from experiments.run import run_path
 from experiments.variants import VARIANTS
@@ -31,6 +31,7 @@ ENSEMBLES = {
     "vote(v2,windows)": ["v2_framing", "j_first70", "j_last70", "j_mid70", "j_trim80"],
     "vote(v2,inverted,clerk)": ["v2_framing", "j_inverted", "j_clerk"],
     "vote(v2,v5)": ["v2_framing", "v5_image_text"],
+    "vote(v4,v5)": ["v4_evidence", "v5_image_text"],
 }
 
 
@@ -53,8 +54,19 @@ def p_invoice(row: dict, variant: str) -> float:
     return {"doc_type": probs.get("invoice"), "not_invoice": probs.get("false")}.get(question_id(variant), probs.get("true"))
 
 
+TEXTS: dict[str, str] = {}
+
+
+def build_for(variant: str):
+    """Raw input is a doc id; the variant gets the OCR text (and the scan, for image variants)."""
+    fn = VARIANTS[variant]
+    if getattr(fn, "needs_image", False):
+        return lambda doc_id: fn(TEXTS[doc_id], image(doc_id))
+    return lambda doc_id: fn(TEXTS[doc_id])
+
+
 def candidate(variant: str) -> Candidate:
-    return Candidate(variant, build=VARIANTS[variant], question_id=question_id(variant), readout=readout(variant))
+    return Candidate(variant, build=build_for(variant), question_id=question_id(variant), readout=readout(variant))
 
 
 def no_model(state, questions):
@@ -63,14 +75,14 @@ def no_model(state, questions):
 
 def load_sample(sample_name: str, cache: AnswerCache) -> tuple[list[Example], list[str]]:
     """Examples for every doc that all complete text runs on this sample share; seeds the cache."""
-    texts = {}
-    for split in ("validation", "test"):
-        texts |= load(split).set_index("doc_id").text.to_dict()
+    if not TEXTS:
+        for split in ("validation", "test"):
+            TEXTS.update(load(split).set_index("doc_id").text.to_dict())
     fixes = corrections()
     rows_by = {}
     for variant in SINGLES:
         path = run_path(variant, sample_name)
-        if path.exists() and not getattr(VARIANTS[variant], "needs_image", False):
+        if path.exists():
             rows_by[variant] = {r["doc_id"]: r for r in map(json.loads, path.open())}
     if not rows_by:
         return [], []
@@ -80,9 +92,9 @@ def load_sample(sample_name: str, cache: AnswerCache) -> tuple[list[Example], li
     for variant in available:
         for i in ids:
             p = p_invoice(rows_by[variant][i], variant)
-            cache.data[AnswerCache.key(STEP, variant, i, VARIANTS[variant](texts[i]))] = {"true": p, "false": 1 - p}
+            cache.data[AnswerCache.key(STEP, variant, i, build_for(variant)(i))] = {"true": p, "false": 1 - p}
     labels = {i: fixes.get(i, rows_by[available[0]][i]["category"] == "invoice") for i in ids}
-    return [Example(i, texts[i], {STEP: labels[i]}) for i in ids], available
+    return [Example(i, i, {STEP: labels[i]}) for i in ids], available
 
 
 def main(samples: str, budgets: list[float]) -> None:
