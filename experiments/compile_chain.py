@@ -160,7 +160,7 @@ def main(budgets: list[float], stop_budget: float = 0.25) -> None:
         compiled = compiler.compile(calibration, error_budget=budget, sequential=True)
         out += [f"## Chain budget {budget:.0%}", "", compiled.report().replace("# Calibration report", "### Calibration report"), ""]
         if held_out:
-            out += [compiled.verify(held_out, cache).replace("# Verification", "### Per-step verification"), ""]
+            out += [compiled.verify(held_out, cache, sequential=True).replace("# Verification", "### Per-step verification"), ""]
             text, _ = end_to_end(compiled, held_out, cache)
             out.append(text)
         out += ["```json", json.dumps(compiled.to_json(), indent=2), "```", ""]

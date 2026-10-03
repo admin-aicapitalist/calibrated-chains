@@ -459,6 +459,12 @@ class CompiledChain:
 
         return Step(step.name, run)
 
+    def _passes(self, result: StepResult, example: Example, cache: AnswerCache | None) -> bool:
+        probs = ask(result.chosen, result.step, example.input, self.backend, cache, example.id)
+        option = max(probs, key=probs.__getitem__)
+        allowed = result.step.continue_options()
+        return probs[option] >= result.gate.tau_for(option) and (allowed is None or option in allowed)
+
     def chain_bound(self) -> float:
         return 1 - math.prod(1 - r.gate.bound for r in self.results.values())
 
@@ -513,15 +519,19 @@ class CompiledChain:
                   "runs on held-out data."]
         return "\n".join(lines) + "\n"
 
-    def verify(self, examples: list[Example], cache: AnswerCache | None = None) -> str:
-        """Frozen gates on held-out examples: does each step stay within its budget?"""
+    def verify(self, examples: list[Example], cache: AnswerCache | None = None, sequential: bool = False) -> str:
+        """Frozen gates on held-out examples: does each step stay within its budget? ``sequential=True``
+        measures each step only on the examples the earlier frozen gates let through, as in the chain."""
         lines = ["# Verification on held-out data", "",
                  "| step | formulation | gate τ | decided | silent errors | rate | 95% bound | budget | holds |",
                  "|---|---|---|---|---|---|---|---|---|"]
         bounds = []
+        reaching = list(examples)
         for name, r in self.results.items():
-            labeled = [e for e in examples if name in e.labels]
+            labeled = [e for e in reaching if name in e.labels]
             probs = [ask(r.chosen, r.step, e.input, self.backend, cache, e.id) for e in labeled]
+            if sequential:
+                reaching = [e for e in reaching if self._passes(r, e, cache)]
             truths = [e.labels[name] for e in labeled]
             scope = r.step.continue_options() if r.step.budget_on == "continue" else None
             g = gate_stats(predictions(probs, truths, prior_weights(truths, self.priors.get(name))),

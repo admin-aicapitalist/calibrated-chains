@@ -435,3 +435,61 @@ labels. From here the chain uses Claude's labels for the 100 labeled docs.
 **Caveat:** these are silver labels. A chain compiled on them certifies agreement with Claude's
 reading of the documents under the written policy, not ground truth. The 79/80 agreement says the
 labels are consistent; it can't say they're right.
+
+### C5 · The full invoice chain, compiled and verified
+
+**Chain** (schematic: <https://claude.ai/artifact/M4VrnWbSwcor7fkr62Dt1E>):
+`is_invoice → invoice_type (standard|recurring) → amount_consistent → under_5000 → payable → decide`,
+where `decide` = APPROVE is a symbolic AND of all passed gates. Clef answers come from two
+text-only passes: `c_text` (chain questions + evidence, one forward pass) and `c_atoms` (the two
+atomic policy conditions). Labels from L1 (Claude). Budget: 30% false approvals at 95%
+confidence, split over 5 steps (6.9% each); miss budget 25% per step. Gates compiled with
+separate yes/no thresholds, **sequentially** (each step calibrated on the documents the earlier
+compiled gates let through).
+
+**Lowering the policy.** Clef's single `approve` question (the 5-condition policy in one prompt)
+failed: the 9 approvable calibration invoices scored 0.01-0.45 while non-approvable invoices
+reached 0.76. The policy was lowered into atomic conditions, each a calibrated gate, joined by an
+exact symbolic AND. Same principle as the compiler's "lowering" step: keep the neural surface to
+small, checkable questions.
+
+**Calibration (bal120, 119 docs):**
+
+| step | gate | reach | correct passes | false passes | 95% bound | budget |
+|---|---|---|---|---|---|---|
+| is_invoice | yes ≥0.90 / no ≥0.51 | 119 | 20 | 1 | 20.7% | 6.9% |
+| invoice_type | ≥0.82 | 20 | 11 | 0 | 23.8% | 6.9% |
+| amount_consistent | yes ≥0.51 / no ≥0.51 | 11 | 6 | 0 | 39.3% | 6.9% |
+| under_5000 | yes ≥0.51 / no ≥0.51 | 6 | 4 | 0 | 52.7% | 6.9% |
+| payable | yes ≥0.69 / no ≥0.51 | 4 | 1 | 1 | 97.5% | 6.9% |
+
+**Held-out (chain_ver: 40 test invoices + 45 non-invoices, frozen gates, sequential):** false
+passes per step: is_invoice 3, every later step 0. **End to end through the Decision monad:**
+
+| outcome | docs |
+|---|---|
+| auto-approved, correct | 2 |
+| **auto-approved, wrong** | **0** |
+| blocked for review | 38 (29 at is_invoice, 9 at invoice_type) |
+| stopped, correct | 41 |
+| stopped, wrong (approvable invoice rejected) | 4 (amount 1, under_5000 2, payable 1) |
+
+**Reading:**
+1. **The full chain works and fails safe.** 0 wrong approvals on unseen documents. Every error
+   the chain makes is a non-approval: a review (45% of docs) or a confident stop of an
+   approvable invoice (4 of 8).
+2. **It is not certified, and can't be at this size.** The data funnel is the constraint:
+   119 calibration docs → 20 reach step 2 → 4 reach the last step. With ~4 decisions at the
+   last gate, even zero errors bound it near 50-100%. Whole-chain bound 99.6% vs 30% budget.
+3. **Automation is low** (2 of 8 approvable held-out invoices approved automatically), mostly
+   because is_invoice needs ≥0.90 for a "yes" and blocks a third of documents. That threshold is
+   the price of 1 false pass in calibration with so few examples.
+4. **What would certify it:** ≥42 correct accepted decisions per step at a 30% chain budget,
+   i.e. about 250 approvable invoices across calibration (~1,500 archive "invoices" to label,
+   since ~17% are approvable). Labeling cost is small (Claude: 25 docs ≈ 1.5 min per agent).
+   Clef on this CPU is the bottleneck: ~17 s/doc text, ~33 s/doc with images, about 7 h for
+   1,500 docs.
+
+**Compiler changes in this step:** sequential calibration and sequential `verify()`; gate grids
+start above 0.5 so a coin flip never passes; compiled chains can replay recorded answers
+(`run(..., cache, example_id)`); `export_chain.py` produces the schematic's data.
