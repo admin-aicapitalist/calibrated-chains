@@ -913,7 +913,7 @@ wheels = [
 ]
 
 [[package]]
-name = "system-one-clef"
+name = "calibrated-chains"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

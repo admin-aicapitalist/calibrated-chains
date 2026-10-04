@@ -1,7 +1,7 @@
 [project]
-name = "system-one-clef"
+name = "calibrated-chains"
 version = "0.1.0"
-description = "Clef-Flash (System One) decisions composed with a symbolic Decision monad"
+description = "Compile neural (Clef/Jev) decisions into monadic chains with measured, budgeted error rates"
 requires-python = ">=3.12"
 dependencies = [
     "torch>=2.11",

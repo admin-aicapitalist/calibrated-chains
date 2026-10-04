@@ -1,4 +1,4 @@
-# system_one_clef
+# calibrated-chains
 
 Neural System One meets a symbolic monad, plus a compiler that turns the combination into a chain with
 **measured, budgeted error rates**.
